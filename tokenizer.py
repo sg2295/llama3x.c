@@ -3,7 +3,6 @@
 # This software may be used and distributed according to the terms of the Llama 3 Community License Agreement.
 
 import argparse
-import array
 import os
 import struct
 from pathlib import Path
@@ -11,6 +10,7 @@ from typing import List
 
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
+from transformers import AutoTokenizer
 
 TOKENIZER_MODEL = "tokenizer.model"  # the llama tiktoken tokenizer model
 
@@ -66,7 +66,7 @@ class Tokenizer:
     ) -> List[int]:
         assert type(s) is str
         self.model.encode(
-            substr,
+            s,
             allowed_special=allowed_special,
             disallowed_special=disallowed_special,
         )
@@ -104,6 +104,36 @@ class Tokenizer:
                 f.write(struct.pack("fI", score, len(bytes)))
                 f.write(bytes)
 
+class HFTokenizerWrapper:
+    def __init__(self, t):
+        self._t = t
+        self.stop_tokens = {t.eos_token_id}
+        if t.pad_token_id is not None:
+            self.stop_tokens.add(t.pad_token_id)
+
+    def encode(self, s, bos=False, eos=False, allowed_special="all", disallowed_special=()):
+        out = self._t.encode(s, add_special_tokens=False)
+        if bos and self._t.bos_token_id is not None:
+            out = [self._t.bos_token_id] + out
+        if eos and self._t.eos_token_id is not None:
+            out = out + [self._t.eos_token_id]
+        return out
+
+    def decode(self, ids):
+        return self._t.decode(ids, skip_special_tokens=False)
+
+def get_tokenizer(hf_model_path: str):
+    # Grab tokenizer from hf repo
+    candidates = [
+        os.path.join(hf_model_path, "original", "tokenizer.model"),
+        os.path.join(hf_model_path, "tokenizer.model"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return Tokenizer(path)
+
+    hf_tok = AutoTokenizer.from_pretrained(hf_model_path, trust_remote_code=True)
+    return HFTokenizerWrapper(hf_tok)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

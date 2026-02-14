@@ -4,9 +4,9 @@ Basically, we have a bunch of versions of the model, and we
 want to export them to .bin files to be read from and inferenced in C.
 
 Among the "input" versions of PyTorch files/models:
-- Official Llama 2 weights released by Meta
+- Official Llama 3 weights released by Meta
 - Huggingface weights available on the hub
-- llama2.c (this repo) trained models
+- llama3x.c (this repo) trained models
 
 Among the "output" versions of .bin files:
 - v0: Legacy files of the original llama2.c repo (will eventually be DEPRECATED)
@@ -53,7 +53,6 @@ def quantize_q80(w, group_size):
     i.e. symmetric quantization into int8, range [-127,127]
     """
     assert w.numel() % group_size == 0
-    ori_shape = w.shape
     w = w.float()  # convert to float32
     w = w.reshape(-1, group_size)
     # find the max in each group
@@ -231,7 +230,7 @@ def version2_export(model, filepath, group_size=64):
     shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
     if not shared_classifier:
         weights.append(model.output.weight)
-    for w in weights:
+    for i, w in enumerate(weights):
         assert (
             w.numel() % group_size == 0
         ), f"weight {i} has numel {w.numel()}, not a multiple of group_size {group_size}"
@@ -531,25 +530,39 @@ def load_hf_model(model_path):
     hf_model = AutoModelForCausalLM.from_pretrained(model_path)
     hf_dict = hf_model.state_dict()
 
-    # convert LlamaConfig to ModelArgs
+    # convert LlamaConfig to ModelArgs (Llama 3.1/3.2 use GQA: num_key_value_heads)
+    hf_config = hf_model.config
     config = ModelArgs()
-    config.dim = hf_model.config.hidden_size
-    config.n_layers = hf_model.config.num_hidden_layers
-    config.n_heads = hf_model.config.num_attention_heads
-    config.n_kv_heads = hf_model.config.num_attention_heads
-    config.vocab_size = hf_model.config.vocab_size
-    config.hidden_dim = hf_model.config.intermediate_size
-    config.norm_eps = hf_model.config.rms_norm_eps
-    config.max_seq_len = hf_model.config.max_position_embeddings
+    config.dim = hf_config.hidden_size
+    config.n_layers = hf_config.num_hidden_layers
+    config.n_heads = hf_config.num_attention_heads
+    config.n_kv_heads = getattr(
+        hf_config, "num_key_value_heads", hf_config.num_attention_heads
+    )
+    config.vocab_size = hf_config.vocab_size
+    config.hidden_dim = hf_config.intermediate_size
+    config.norm_eps = hf_config.rms_norm_eps
+    config.max_seq_len = getattr(
+        hf_config, "max_position_embeddings", 131072
+    )
 
-    # create a new Transformer object and set weights
+    config.rope_theta = hf_config.rope_scaling.get("rope_theta", 10000.0)
+    config.rope_scaling_type = hf_config.rope_scaling.get("rope_type", "default")
+    config.rope_scaling_factor = hf_config.rope_scaling.get("factor", 1.0)
+    config.rope_original_max_position_embeddings = hf_config.rope_scaling.get("original_max_position_embeddings", 8192)
+    config.rope_low_freq_factor = hf_config.rope_scaling.get("low_freq_factor", 1.0)
+    config.rope_high_freq_factor = hf_config.rope_scaling.get("high_freq_factor", 4.0)
+
     model = Transformer(config)
+
+    head_dim = config.dim // config.n_heads
+    kv_dim = config.n_kv_heads * head_dim
 
     model.tok_embeddings.weight = nn.Parameter(hf_dict["model.embed_tokens.weight"])
     model.norm.weight = nn.Parameter(hf_dict["model.norm.weight"])
 
-    # huggingface permutes WQ and WK, this function reverses it
-    def permute_reverse(w, n_heads=config.n_heads, dim1=config.dim, dim2=config.dim):
+    # huggingface permutes WQ and WK for RoPE; reverse it here
+    def permute_reverse(w, n_heads: int, dim1: int, dim2: int):
         return (
             w.view(n_heads, 2, dim1 // n_heads // 2, dim2)
             .transpose(1, 2)
@@ -562,10 +575,20 @@ def load_hf_model(model_path):
             hf_dict[f"model.layers.{i}.input_layernorm.weight"]
         )
         layer.attention.wq.weight = nn.Parameter(
-            permute_reverse(hf_dict[f"model.layers.{i}.self_attn.q_proj.weight"])
+            permute_reverse(
+                hf_dict[f"model.layers.{i}.self_attn.q_proj.weight"],
+                config.n_heads,
+                config.dim,
+                config.dim,
+            )
         )
         layer.attention.wk.weight = nn.Parameter(
-            permute_reverse(hf_dict[f"model.layers.{i}.self_attn.k_proj.weight"])
+            permute_reverse(
+                hf_dict[f"model.layers.{i}.self_attn.k_proj.weight"],
+                config.n_kv_heads,
+                kv_dim,
+                config.dim,
+            )
         )
         layer.attention.wv.weight = nn.Parameter(
             hf_dict[f"model.layers.{i}.self_attn.v_proj.weight"]

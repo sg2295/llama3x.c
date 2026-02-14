@@ -279,6 +279,7 @@ float *forward(Transformer *transformer, int token, int pos) {
     matmul(s->k, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim);
     matmul(s->v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim);
 
+    // TODO: change for llama3.1/2
     // RoPE relative positional encoding: complex-valued rotate q and k in each head
     for (int i = 0; i < p->n_heads; i++) {
       for (int j = 0; j < head_size; j += 2) {

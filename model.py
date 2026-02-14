@@ -1,10 +1,8 @@
 import inspect
 import math
-import struct
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -12,17 +10,25 @@ from torch import nn
 
 @dataclass
 class ModelArgs:
-    # default hyperparameters for the Llama 7B model
-    dim: int = 4096
-    n_layers: int = 32
+    # default hyperparameters for the Llama3.2 1B model
+    dim: int = 2048
+    n_layers: int = 16
     n_heads: int = 32
-    n_kv_heads: Optional[int] = None
-    vocab_size: int = 32000
-    hidden_dim: Optional[int] = None
+    n_kv_heads: Optional[int] = 8  # GQA
+    vocab_size: int = 128256
+    hidden_dim: Optional[int] = 5632  # intermediate_size
     multiple_of: int = 256  # MLP hidden layer size will be multiple of
     norm_eps: float = 1e-5
-    max_seq_len: int = 2048
+    max_seq_len: int = 131072  # 128k
     dropout: float = 0.0
+
+    rope_theta: float = 10000.0
+    rope_scaling_type: str = "llama3"
+    rope_scaling_factor: float = 1.0
+    # Only used for llama3 rope scaling
+    rope_original_max_position_embeddings: int = 8192
+    rope_low_freq_factor: float = 1.0
+    rope_high_freq_factor: float = 4.0
 
 
 class RMSNorm(torch.nn.Module):
@@ -39,50 +45,75 @@ class RMSNorm(torch.nn.Module):
         return output * self.weight
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cos = torch.cos(freqs)  # real part
-    freqs_sin = torch.sin(freqs)  # imaginary part
-    return freqs_cos, freqs_sin
-
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(shape)
-
-
-def apply_rotary_emb(
-    xq: torch.Tensor, xk: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor
+def build_rope_cos_sin(
+    head_dim: int,
+    max_seq_len: int,
+    rope_theta: float,
+    rope_scaling_type: str,
+    rope_scaling_factor: float,
+    rope_original_max_position_embeddings: int,
+    rope_low_freq_factor: float,
+    rope_high_freq_factor: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert head_dim % 2 == 0, "RoPE expects even head dim"
+    dim_half = head_dim // 2
+    inv_freq = 1.0 / (
+        rope_theta ** (torch.arange(0, dim_half).float() * 2.0 / head_dim)
+    )
 
-    # reshape xq and xk to match the complex representation
-    xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
-    xk_r, xk_i = xk.float().reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
+    scaling_type = (rope_scaling_type or "default").lower()
+    if scaling_type == "linear":
+        if rope_scaling_factor != 1.0:
+            inv_freq = inv_freq / rope_scaling_factor
+    elif scaling_type == "llama3":
+        assert rope_original_max_position_embeddings is not None, "rope_original_max_position_embeddings is required for llama3 scaling"
+        old_ctx = rope_original_max_position_embeddings
+        low_wavelen = old_ctx / rope_low_freq_factor
+        high_wavelen = old_ctx / rope_high_freq_factor
+        wavelen = 2 * math.pi / inv_freq
+        inv_freq_llama = torch.where(
+            wavelen > low_wavelen, inv_freq / rope_scaling_factor, inv_freq
+        )
+        smooth_factor = (old_ctx / wavelen - rope_low_freq_factor) / (
+            rope_high_freq_factor - rope_low_freq_factor
+        )
+        smoothed = (
+            (1 - smooth_factor) * inv_freq_llama / rope_scaling_factor
+            + smooth_factor * inv_freq_llama
+        )
+        is_medium = (~(wavelen < high_wavelen)) & (~(wavelen > low_wavelen))
+        inv_freq = torch.where(is_medium, smoothed, inv_freq_llama)
+    elif scaling_type != "default":
+        raise ValueError(f"Invalid rope scaling type: {rope_scaling_type}")
 
-    # reshape freqs_cos and freqs_sin for broadcasting
-    freqs_cos = reshape_for_broadcast(freqs_cos, xq_r)
-    freqs_sin = reshape_for_broadcast(freqs_sin, xq_r)
+    t = torch.arange(max_seq_len).float()
+    angles = torch.outer(t, inv_freq)  # (L, D//2)
+    return torch.cos(angles), torch.sin(angles)
 
-    # apply rotation using real numbers
-    xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
-    xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
-    xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
-    xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
 
-    # flatten last two dimensions
-    xq_out = torch.stack([xq_out_r, xq_out_i], dim=-1).flatten(3)
-    xk_out = torch.stack([xk_out_r, xk_out_i], dim=-1).flatten(3)
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    B, L, H, D = x.shape
+    assert D % 2 == 0, "RoPE expects even head dim"
 
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    # Select cos/sin rows for the current tokens using [0, L)
+    cos_sel = cos[:L].unsqueeze(0).unsqueeze(2)  # (1, L, 1, D//2)
+    sin_sel = sin[:L].unsqueeze(0).unsqueeze(2)  # (1, L, 1, D//2)
+
+    # Interleave to match even/odd dims
+    cos_2 = torch.repeat_interleave(cos_sel, 2, dim=-1)  # (..., D)
+    sin_2 = torch.repeat_interleave(sin_sel, 2, dim=-1)  # (..., D)
+
+    # Split even/odd, rotate pairs: (x0, x1) -> (-x1, x0)
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+    x_rot_even = -x_odd
+    x_rot_odd = x_even
+    x_rot = torch.stack((x_rot_even, x_rot_odd), dim=-1).reshape_as(x)
+
+    return x * cos_2 + x_rot * sin_2
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -136,7 +167,8 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
         # RoPE relative positional embeddings
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
+        xq = apply_rope(xq, freqs_cos, freqs_sin)
+        xk = apply_rope(xk, freqs_cos, freqs_sin)
 
         # grouped multiquery attention: expand out keys and values
         xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
@@ -238,9 +270,17 @@ class Transformer(nn.Module):
             self.output.weight
         )  # https://paperswithcode.com/method/weight-tying
 
-        # some useful precompute for the RoPE relative positional embeddings
-        freqs_cos, freqs_sin = precompute_freqs_cis(
-            self.params.dim // self.params.n_heads, self.params.max_seq_len
+        # precompute RoPE cos/sin
+        head_dim = self.params.dim // self.params.n_heads
+        freqs_cos, freqs_sin = build_rope_cos_sin(
+            head_dim,
+            self.params.max_seq_len,
+            self.params.rope_theta,
+            self.params.rope_scaling_type,
+            self.params.rope_scaling_factor,
+            self.params.rope_original_max_position_embeddings,
+            self.params.rope_low_freq_factor,
+            self.params.rope_high_freq_factor,
         )
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
