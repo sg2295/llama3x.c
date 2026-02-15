@@ -65,12 +65,11 @@ class Tokenizer:
         self, s: str, bos: bool, eos: bool, allowed_special, disallowed_special
     ) -> List[int]:
         assert type(s) is str
-        self.model.encode(
+        t = self.model.encode(
             s,
             allowed_special=allowed_special,
             disallowed_special=disallowed_special,
         )
-
         if bos:
             t.insert(0, self.bos_id)
         if eos:

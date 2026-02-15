@@ -1,7 +1,7 @@
 import argparse
 import torch
 
-import export
+from export import load_hf_model
 from tokenizer import get_tokenizer
 
 
@@ -12,12 +12,12 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--prompt", type=str, help="prompt to generate", default="In a galaxy")
     parser.add_argument("-n", "--max-tokens", type=int, default=128, help="Max tokens to generate")
     parser.add_argument("-t", "--temperature", type=float, default=1.0, help="Sampling temperature (0.0 = greedy)")
-    parser.add_argument("--device", type=str, default=None, help="Device to run on (e.g. cuda, mps, cpu)")
+    parser.add_argument("--device", type=str, default=None, help="Torch device")
 
     args = parser.parse_args()
     dtype = {"fp16": torch.float16, "fp32": torch.float32}[args.dtype]
 
-    model = export.load_hf_model(args.hf_model_path)
+    model = load_hf_model(args.hf_model_path)
 
     if model is None:
         parser.error("Can't load input model!")
@@ -26,7 +26,7 @@ if __name__ == "__main__":
     if args.device is not None:
         device = torch.device(args.device)
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device(args.device or ("mps" if torch.backends.mps.is_available() else "cpu"))
     print(f"Using device: {device} with dtype: {dtype}")
     model.to(device=device, dtype=dtype)
 
