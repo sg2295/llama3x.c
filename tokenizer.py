@@ -10,7 +10,6 @@ from typing import List
 
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
-from transformers import AutoTokenizer
 
 TOKENIZER_MODEL = "tokenizer.model"  # the llama tiktoken tokenizer model
 
@@ -18,8 +17,7 @@ TOKENIZER_MODEL = "tokenizer.model"  # the llama tiktoken tokenizer model
 class Tokenizer:
     pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 
-    def __init__(self, tokenizer_model=None):
-        model_path = tokenizer_model if tokenizer_model else TOKENIZER_MODEL
+    def __init__(self, model_path: str=TOKENIZER_MODEL):
         assert os.path.isfile(model_path), model_path
         mergeable_ranks = load_tiktoken_bpe(model_path)
         self.model_path = model_path
@@ -79,7 +77,7 @@ class Tokenizer:
     def decode(self, t: List[int]) -> str:
         return self.model.decode(t)
 
-    def export(self):
+    def export(self, tokenizer_bin: str):
 
         # get all the tokens (postprocessed) and their scores as floats
         tokens, scores = [], []
@@ -96,32 +94,13 @@ class Tokenizer:
 
         # write to a binary file
         # the tokenizer.bin file is the same as .model file, but .bin
-        tokenizer_bin = self.model_path.replace(".model", ".bin")
         with open(tokenizer_bin, "wb") as f:
             f.write(struct.pack("I", max_token_length))
             for bytes, score in zip(tokens, scores):
                 f.write(struct.pack("fI", score, len(bytes)))
                 f.write(bytes)
 
-class HFTokenizerWrapper:
-    def __init__(self, t):
-        self._t = t
-        self.stop_tokens = {t.eos_token_id}
-        if t.pad_token_id is not None:
-            self.stop_tokens.add(t.pad_token_id)
-
-    def encode(self, s, bos=False, eos=False, allowed_special="all", disallowed_special=()):
-        out = self._t.encode(s, add_special_tokens=False)
-        if bos and self._t.bos_token_id is not None:
-            out = [self._t.bos_token_id] + out
-        if eos and self._t.eos_token_id is not None:
-            out = out + [self._t.eos_token_id]
-        return out
-
-    def decode(self, ids):
-        return self._t.decode(ids, skip_special_tokens=False)
-
-def get_tokenizer(hf_model_path: str):
+def get_tokenizer(hf_model_path: str) -> Tokenizer:
     # Grab tokenizer from hf repo
     candidates = [
         os.path.join(hf_model_path, "original", "tokenizer.model"),
@@ -131,16 +110,14 @@ def get_tokenizer(hf_model_path: str):
         if os.path.isfile(path):
             return Tokenizer(path)
 
-    hf_tok = AutoTokenizer.from_pretrained(hf_model_path, trust_remote_code=True)
-    return HFTokenizerWrapper(hf_tok)
+    raise ValueError(f"No tokenizer found in {hf_model_path}!")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-t", "--tokenizer-model", type=str, help="optional path to custom tokenizer "
-    )
+    parser.add_argument("input_hf_model", type=str, help="input huggingface model path")
+    parser.add_argument("output_tokenizer_bin", type=str, help="output tokenizer binary path", default="tokenizer.bin")
 
     args = parser.parse_args()
 
-    t = Tokenizer(args.tokenizer_model)
-    t.export()
+    t = get_tokenizer(args.input_hf_model)
+    t.export(args.output_tokenizer_bin)

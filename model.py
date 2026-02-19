@@ -14,9 +14,9 @@ class ModelArgs:
     dim: int = 2048
     n_layers: int = 16
     n_heads: int = 32
-    n_kv_heads: Optional[int] = 8  # GQA
+    n_kv_heads: int = 8  # GQA
     vocab_size: int = 128256
-    hidden_dim: Optional[int] = 5632  # intermediate_size
+    hidden_dim: int = 8192  # intermediate_size
     multiple_of: int = 256  # MLP hidden layer size will be multiple of
     norm_eps: float = 1e-5
     max_seq_len: int = 131072  # 128k

@@ -1,1 +1,12 @@
+*
+!/**/
+!*.*
+
 .vscode/
+__pycache__/
+
+*.txt
+*.json
+*.pyc
+*.bin
+*.out

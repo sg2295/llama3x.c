@@ -1,4 +1,7 @@
-/* Inference for Llama-3 Transformer model in pure C */
+/*
+Inference for Llama 3.x Transformer model in pure C.
+Use legacy export to produce compatible .bin files.
+*/
 
 #include <ctype.h>
 #include <fcntl.h>
@@ -37,6 +40,9 @@ typedef struct {
   float *wk; // (layer, dim, n_kv_heads * head_size)
   float *wv; // (layer, dim, n_kv_heads * head_size)
   float *wo; // (layer, n_heads * head_size, dim)
+  // weights for RoPE
+  float *freqs_cos;   // (seq_len, n_heads)
+  float *freqs_sin;   // (seq_len, n_heads)
   // weights for ffn
   float *w1; // (layer, hidden_dim, dim)
   float *w2; // (layer, dim, hidden_dim)
@@ -133,8 +139,10 @@ void memory_map_weights(TransformerWeights *w, Config *p, float *ptr, int shared
   ptr += n_layers * p->dim * p->hidden_dim;
   w->rms_final_weight = ptr;
   ptr += p->dim;
-  ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
-  ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
+  w->freqs_cos = ptr;
+  ptr += p->seq_len * p->n_heads;
+  w->freqs_sin = ptr;
+  ptr += p->seq_len * p->n_heads;
   w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
@@ -173,6 +181,9 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
   }
   float *weights_ptr = *data + sizeof(Config) / sizeof(float);
   memory_map_weights(weights, config, weights_ptr, shared_weights);
+  fprintf(stderr, "Loaded: dim=%d hidden=%d layers=%d heads=%d kv_heads=%d vocab=%d seq_len=%d\n",
+          config->dim, config->hidden_dim, config->n_layers, config->n_heads,
+          config->n_kv_heads, config->vocab_size, config->seq_len);
 }
 
 void build_transformer(Transformer *t, char *checkpoint_path) {
@@ -279,14 +290,13 @@ float *forward(Transformer *transformer, int token, int pos) {
     matmul(s->k, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim);
     matmul(s->v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim);
 
-    // TODO: change for llama3.1/2
-    // RoPE relative positional encoding: complex-valued rotate q and k in each head
+    // RoPE: precomputed cosine and sine values for each position/head.
     for (int i = 0; i < p->n_heads; i++) {
       for (int j = 0; j < head_size; j += 2) {
-        float freq = 1.0f / powf(500000.0f, (float)j / (float)head_size);
-        float val = pos * freq;
-        float fcr = cosf(val);
-        float fci = sinf(val);
+        int dim_idx = j / 2;
+        int idx = pos * p->n_heads + dim_idx;
+        float fcr = w->freqs_cos[idx];
+        float fci = w->freqs_sin[idx];
         float q0 = s->q[i * head_size + j];
         float q1 = s->q[i * head_size + j + 1];
         s->q[i * head_size + j] = q0 * fcr - q1 * fci;
@@ -1005,7 +1015,7 @@ int main(int argc, char *argv[]) {
   char *checkpoint_path = NULL; // e.g. out/model.bin
   char *tokenizer_path = "tokenizer.bin";
   float temperature = 1.0f;        // 0.0 = greedy deterministic. 1.0 = original. don't set higher
-  float topp = 0.9f;               // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
+  float topp = 1.0f;               // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
   int steps = 4096;                // number of steps to run for
   char *prompt = NULL;             // prompt string
   unsigned long long rng_seed = 0; // seed rng with time by default
