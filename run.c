@@ -11,6 +11,7 @@ Use legacy export to produce compatible .bin files.
 #include <string.h>
 #include <time.h>
 #include <omp.h>
+#include <limits.h>
 #if defined _WIN32
 #include "win.h"
 #else
@@ -582,7 +583,7 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     while (n_parts > 1) {
       int best_idx = -1;
       int best_id = -1;
-      int best_rank = 0x7fffffff;
+      int best_rank = INT_MAX;
       for (int i = 0; i < n_parts - 1; i++) {
         int left_len = lens[i];
         int right_len = lens[i + 1];
@@ -980,12 +981,173 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
 }
 
 // ----------------------------------------------------------------------------
+// perplexity
+// Perplexity score = exp(mean cross-entropy loss)
+// ppl_stride == 0: non-overlapping chunks, score second half only.
+// ppl_stride > 0: strided overlapping chunks, score last ppl_stride positions per chunk.
+
+void clear_kv_cache(RunState *s, Config *p) {
+  int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+  size_t cache_size = (size_t)p->n_layers * p->seq_len * kv_dim * sizeof(float);
+  memset(s->key_cache, 0, cache_size);
+  memset(s->value_cache, 0, cache_size);
+}
+
+float cross_entropy_loss(float *logits, int vocab_size, int target) {
+  if (target < 0 || target >= vocab_size)
+    return 0.0f;
+  float max_val = logits[0];
+  for (int i = 1; i < vocab_size; i++) {
+    if (logits[i] > max_val)
+      max_val = logits[i];
+  }
+  float sum = 0.0f;
+  for (int i = 0; i < vocab_size; i++) {
+    sum += expf(logits[i] - max_val);
+  }
+  float log_sum = max_val + logf(sum);
+  return log_sum - logits[target];
+}
+
+void perplexity(
+    Transformer *transformer,
+    Tokenizer *tokenizer,
+    const char *data_path,
+    int n_ctx,
+    int ppl_stride,
+    int n_chunks) {
+  Config *p = &transformer->config;
+  RunState *s = &transformer->state;
+  int vocab_size = p->vocab_size;
+
+  if (n_ctx > p->seq_len) {
+    fprintf(stderr, "n_ctx %d exceeds seq_len %d\n", n_ctx, p->seq_len);
+    return;
+  }
+  if (ppl_stride > 0 && ppl_stride >= n_ctx) {
+    fprintf(stderr, "ppl_stride must be < n_ctx when > 0\n");
+    return;
+  }
+
+  // Load file
+  FILE *f = fopen(data_path, "rb");
+  if (!f) {
+    fprintf(stderr, "Could not open %s\n", data_path);
+    return;
+  }
+  fseek(f, 0, SEEK_END);
+  long fsize = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  char *text = malloc(fsize + 1);
+  if (!text) {
+    fclose(f);
+    fprintf(stderr, "malloc failed\n");
+    return;
+  }
+  if (fread(text, 1, fsize, f) != (size_t)fsize) {
+    free(text);
+    fclose(f);
+    fprintf(stderr, "Failed to read file\n");
+    return;
+  }
+  text[fsize] = '\0';
+  fclose(f);
+
+  // Tokenize (add BOS)
+  int max_tokens = (int)(fsize * 2) + 128;  // rough upper bound
+  int *tokens = malloc((size_t)max_tokens * sizeof(int));
+  if (!tokens) {
+    free(text);
+    fprintf(stderr, "malloc failed\n");
+    return;
+  }
+  int num_tokens = 0;
+
+  printf("Tokenising...\n");
+  encode(tokenizer, text, 1, 0, tokens, &num_tokens);
+  free(text);
+  if (num_tokens < 2) {
+    fprintf(stderr, "Too few tokens in file\n");
+    free(tokens);
+    return;
+  }
+  printf("Tokenised!\n");
+
+  int min_tokens = (ppl_stride == 0) ? (2 * n_ctx) : (n_ctx + 1);
+  if (num_tokens < min_tokens) {
+    fprintf(stderr, "Need at least %d tokens, got %d. Use longer file or smaller n_ctx.\n",
+            min_tokens, num_tokens);
+    free(tokens);
+    return;
+  }
+
+  int stride = (ppl_stride == 0) ? n_ctx : ppl_stride;
+  int first_scored = (ppl_stride == 0) ? (n_ctx / 2) : (n_ctx - 1 - ppl_stride);
+
+  int chunk_count = 0;
+  double total_loss = 0.0;
+  int total_scored = 0;
+  #ifdef __FAST_MATH__
+    const float inf = 1e10f;  // fake-away infinity check for ffast-math
+  #else
+    const float inf = INFINITY;
+  #endif
+
+  fprintf(stderr, "Calculating perplexity over chunks (n_ctx=%d ppl_stride=%d first_scored=%d)\n",
+          n_ctx, ppl_stride, first_scored);
+
+  for (int start = 0; start <= num_tokens - n_ctx; start += stride) {
+    if (n_chunks >= 0 && chunk_count >= n_chunks)
+      break;
+
+    clear_kv_cache(s, p);
+
+    int *chunk = tokens + start;
+    double chunk_loss = 0.0;
+    int chunk_scored = 0;
+
+    for (int pos = 0; pos < n_ctx - 1; pos++) {
+      float *logits = forward(transformer, chunk[pos], pos);
+      int target = chunk[pos + 1];
+
+      if (pos >= first_scored) {
+        float loss = cross_entropy_loss(logits, vocab_size, target);
+        chunk_loss += (double)loss;
+        chunk_scored++;
+      }
+    }
+
+    if (chunk_scored > 0) {
+      total_loss += chunk_loss;
+      total_scored += chunk_scored;
+      chunk_count++;
+      float cum_ppl = (float)exp(total_loss / total_scored);
+      fprintf(stderr, "[%d]%.4f ", chunk_count, cum_ppl < 1e2f ? cum_ppl : 1e10f);
+    }
+  }
+  fprintf(stderr, "\n");
+
+  free(tokens);
+
+  if (total_scored == 0) {
+    fprintf(stderr, "No chunks scored\n");
+    return;
+  }
+
+  float mean_loss = (float)(total_loss / total_scored);
+  float ppl = (mean_loss < 1e2f) ? (float)exp(mean_loss) : 1e10f;
+  fprintf(stdout, "Loss:  %.4f\n", mean_loss);
+  fprintf(stdout, "PPL:   %.4f\n", ppl);
+}
+
+// ----------------------------------------------------------------------------
 // CLI, include only if not testing
 #ifndef TESTING
 
 void error_usage() {
   fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
   fprintf(stderr, "Example: run model.bin -n 4096 -i \"Once upon a time\"\n");
+  fprintf(stderr, "         run model.bin -m perplexity -d eval.txt -c 512\n");
   fprintf(stderr, "Options:\n");
   fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
   fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
@@ -993,8 +1155,12 @@ void error_usage() {
   fprintf(stderr, "  -n <int>    number of steps to run for, default 4096. 0 = max_seq_len\n");
   fprintf(stderr, "  -i <string> input prompt\n");
   fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
-  fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
+  fprintf(stderr, "  -m <string> mode: generate|chat|perplexity, default: generate\n");
   fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
+  fprintf(stderr, "  -d <string> data file path (required for perplexity mode)\n");
+  fprintf(stderr, "  -c <int>    context size for perplexity, default 512\n");
+  fprintf(stderr, "  -S <int>    ppl stride; 0=non-overlapping, >0=strided, default 0\n");
+  fprintf(stderr, "  -K <int>    max chunks for perplexity (-1=all), default -1\n");
   exit(EXIT_FAILURE);
 }
 
@@ -1008,8 +1174,12 @@ int main(int argc, char *argv[]) {
   int steps = 4096;                // number of steps to run for
   char *prompt = NULL;             // prompt string
   unsigned long long rng_seed = 0; // seed rng with time by default
-  char *mode = "generate";         // generate|chat
+  char *mode = "generate";         // generate|chat|perplexity
   char *system_prompt = NULL;      // the (optional) system prompt to use in chat mode
+  char *data_path = NULL;          // for perplexity
+  int ctx_size = 512;              // for perplexity
+  int ppl_stride = 0;              // for perplexity
+  int max_chunks = -1;             // for perplexity
 
   // poor man's C argparse so we can override the defaults above from the command line
   if (argc >= 2) {
@@ -1045,6 +1215,14 @@ int main(int argc, char *argv[]) {
       mode = argv[i + 1];
     } else if (argv[i][1] == 'y') {
       system_prompt = argv[i + 1];
+    } else if (argv[i][1] == 'd') {
+      data_path = argv[i + 1];
+    } else if (argv[i][1] == 'c') {
+      ctx_size = atoi(argv[i + 1]);
+    } else if (argv[i][1] == 'S') {
+      ppl_stride = atoi(argv[i + 1]);
+    } else if (argv[i][1] == 'K') {
+      max_chunks = atoi(argv[i + 1]);
     } else {
       error_usage();
     }
@@ -1070,22 +1248,29 @@ int main(int argc, char *argv[]) {
   Tokenizer tokenizer;
   build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
 
-  // build the Sampler
-  Sampler sampler;
-  build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
-
   // run!
-  if (strcmp(mode, "generate") == 0) {
+  if (strcmp(mode, "perplexity") == 0) {
+    if (!data_path) {
+      fprintf(stderr, "perplexity mode requires -d <data_file>\n");
+      error_usage();
+    }
+    perplexity(&transformer, &tokenizer, data_path, ctx_size, ppl_stride, max_chunks);
+  } else if (strcmp(mode, "generate") == 0) {
+    Sampler sampler;
+    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
     generate(&transformer, &tokenizer, &sampler, prompt, steps);
+    free_sampler(&sampler);
   } else if (strcmp(mode, "chat") == 0) {
+    Sampler sampler;
+    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
     chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+    free_sampler(&sampler);
   } else {
     fprintf(stderr, "unknown mode: %s\n", mode);
     error_usage();
   }
 
   // memory and file handles cleanup
-  free_sampler(&sampler);
   free_tokenizer(&tokenizer);
   free_transformer(&transformer);
   return 0;
