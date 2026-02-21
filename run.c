@@ -13,11 +13,36 @@ Use legacy export to produce compatible .bin files.
 #include <omp.h>
 #include <limits.h>
 #if defined _WIN32
-#include "win.h"
+  #include "win.h"
 #else
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+
+// Available attention types
+#define STANDARD 1
+#define FLASH_V2 2
+
+#ifndef ATTN_TYPE
+#define ATTN_TYPE STANDARD
+#endif
+
+#if ATTN_TYPE == STANDARD
+#define ATTN standard_attention
+#elif ATTN_TYPE == FLASH_V2
+#define ATTN flash_attention
+#else
+#error "Invalid SA_TYPE"
+#endif
+
+#ifdef __FAST_MATH__
+  // fake-away infinity for ffast-math
+  #define INF 1e10f
+#else
+  #define INF INFINITY
+#endif
+
+
 // ----------------------------------------------------------------------------
 // Transformer model
 
@@ -183,9 +208,11 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
   }
   float *weights_ptr = *data + sizeof(Config) / sizeof(float);
   memory_map_weights(weights, config, weights_ptr, shared_weights);
-  fprintf(stderr, "Loaded: dim=%d hidden=%d layers=%d heads=%d kv_heads=%d vocab=%d seq_len=%d\n",
+
+  char *attn_type_str = ATTN_TYPE == STANDARD ? "standard" : "flash";
+  fprintf(stderr, "Model config: dim=%d hidden=%d layers=%d heads=%d kv_heads=%d vocab=%d seq_len=%d (attn_type=%s)\n",
           config->dim, config->hidden_dim, config->n_layers, config->n_heads,
-          config->n_kv_heads, config->vocab_size, config->seq_len);
+          config->n_kv_heads, config->vocab_size, config->seq_len, attn_type_str);
 }
 
 void build_transformer(Transformer *t, char *checkpoint_path) {
@@ -225,14 +252,19 @@ void rmsnorm(float *restrict o, const float *restrict x, const float *restrict w
   }
 }
 
-void softmax(float *x, int size) {
-  // find max value (for numerical stability)
+float reduce_max(float *x, int size) {
   float max_val = x[0];
   for (int i = 1; i < size; i++) {
     if (x[i] > max_val) {
       max_val = x[i];
     }
   }
+  return max_val;
+}
+
+void softmax(float *x, int size) {
+  // find max value (for numerical stability)
+  float max_val = reduce_max(x, size);
   // exp and sum
   float sum = 0.0f;
   for (int i = 0; i < size; i++) {
@@ -245,6 +277,118 @@ void softmax(float *x, int size) {
     x[i] *= inv_sum;
   }
 }
+
+void standard_attention(RunState *s, Config *p, int pos, int head_size, int kv_dim, int kv_mul, int loff) {
+  const float inv_sqrt_head_size = 1.0f / sqrtf((float)head_size);
+  int h;
+#pragma omp parallel for private(h)
+  for (h = 0; h < p->n_heads; h++) {
+    // get the query vector for this head
+    float *q = s->q + h * head_size;
+    // attention scores for this head
+    float *att = s->att + h * p->seq_len;
+    int kv_head_off = (h / kv_mul) * head_size;
+    // iterate over all timesteps, including the current one
+    for (int t = 0; t <= pos; t++) {
+      // get the key vector for this head and at this timestep
+      float *k = s->key_cache + loff + t * kv_dim + kv_head_off;
+      // calculate the attention score as the dot product of q and k
+      float score = 0.0f;
+      for (int i = 0; i < head_size; i++) {
+        score += q[i] * k[i];
+      }
+      score *= inv_sqrt_head_size;
+      // save the score to the attention buffer
+      att[t] = score;
+    }
+
+    // softmax the scores to get attention weights, from 0..pos inclusively
+    softmax(att, pos + 1);
+
+    // weighted sum of the values, store back into xb
+    float *xb = s->xb + h * head_size;
+    memset(xb, 0, head_size * sizeof(float));
+    for (int t = 0; t <= pos; t++) {
+      // get the value vector for this head and at this timestep
+      float *v = s->value_cache + loff + t * kv_dim + kv_head_off;
+      // get the attention weight for this timestep
+      float a = att[t];
+      // accumulate the weighted value into xb
+      for (int i = 0; i < head_size; i++) {
+        xb[i] += a * v[i];
+      }
+    }
+  }
+}
+
+// FlashAttention v2 (https://arxiv.org/abs/2307.08691); online softmax + KV-blocks
+#define K_BLK 128
+
+void flash_attention(RunState *s, Config *p, int pos, int head_size, int kv_dim, int kv_mul, int loff) {
+  const float inv_sqrt_head_size = 1.0f / sqrtf((float)head_size);
+  int h;
+#pragma omp parallel for private(h)
+  for (h = 0; h < p->n_heads; h++) {
+    float *q = s->q + h * head_size;
+    float *xb = s->xb + h * head_size;
+    int kv_head_off = (h / kv_mul) * head_size;
+
+    float cmax = -INF;
+    float csum = 0.0f;  // Running sum of exps
+    memset(xb, 0, head_size * sizeof(float));
+
+    int n = pos + 1;
+    for (int k_start = 0; k_start < n; k_start += K_BLK) {
+      int k_end = (k_start + K_BLK < n) ? (k_start + K_BLK) : n;
+      int k_size = k_end - k_start;
+
+      // S = Q @ K^T
+      float scores[K_BLK];
+      for (int j = 0; j < k_size; j++) {
+        float *k = s->key_cache + loff + (k_start + j) * kv_dim + kv_head_off;
+        float score = 0.0f;
+        for (int i = 0; i < head_size; i++) {
+          score += q[i] * k[i];
+        }
+        scores[j] = score * inv_sqrt_head_size;
+      }
+
+      // Update running max
+      float bmax = reduce_max(scores, k_size);
+      float nmax = (bmax > cmax) ? bmax : cmax;      
+      float correction = expf(cmax - nmax);
+
+      // Calculate probs for current block
+      float bsum = 0.0f;
+      float probs[K_BLK];
+      for (int j = 0; j < k_size; j++) {
+        probs[j] = expf(scores[j] - nmax);
+        bsum += probs[j];
+      }
+      float nsum = csum * correction + bsum;
+
+      // Adjust previous outs
+      float scale_prior = (nsum > 0.0f) ? (csum * correction / nsum) : 0.0f;
+      for (int i = 0; i < head_size; i++) {
+        xb[i] *= scale_prior;
+      }
+
+      // Add block contrib
+      for (int j = 0; j < k_size; j++) {
+        float w = (nsum > 0.0f) ? (probs[j] / nsum) : 0.0f;
+        float *v = s->value_cache + loff + (k_start + j) * kv_dim + kv_head_off;
+        for (int i = 0; i < head_size; i++) {
+          xb[i] += w * v[i];
+        }
+      }
+
+      // Update running max/sum of exps
+      cmax = nmax;
+      csum = nsum;
+    }
+  }
+}
+
 
 void matmul(float *xout, float *x, float *w, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
@@ -272,7 +416,6 @@ float *forward(Transformer *transformer, int token, int pos) {
   int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
   int hidden_dim = p->hidden_dim;
   int head_size = dim / p->n_heads;
-  const float inv_sqrt_head_size = 1.0f / sqrtf((float)head_size);
 
   // copy the token embedding into x
   float *content_row = w->token_embedding_table + token * dim;
@@ -325,45 +468,7 @@ float *forward(Transformer *transformer, int token, int pos) {
     }
 
     // multihead attention. iterate over all heads
-    int h;
-#pragma omp parallel for private(h)
-    for (h = 0; h < p->n_heads; h++) {
-      // get the query vector for this head
-      float *q = s->q + h * head_size;
-      // attention scores for this head
-      float *att = s->att + h * p->seq_len;
-      int kv_head_off = (h / kv_mul) * head_size;
-      // iterate over all timesteps, including the current one
-      for (int t = 0; t <= pos; t++) {
-        // get the key vector for this head and at this timestep
-        float *k = s->key_cache + loff + t * kv_dim + kv_head_off;
-        // calculate the attention score as the dot product of q and k
-        float score = 0.0f;
-        for (int i = 0; i < head_size; i++) {
-          score += q[i] * k[i];
-        }
-        score *= inv_sqrt_head_size;
-        // save the score to the attention buffer
-        att[t] = score;
-      }
-
-      // softmax the scores to get attention weights, from 0..pos inclusively
-      softmax(att, pos + 1);
-
-      // weighted sum of the values, store back into xb
-      float *xb = s->xb + h * head_size;
-      memset(xb, 0, head_size * sizeof(float));
-      for (int t = 0; t <= pos; t++) {
-        // get the value vector for this head and at this timestep
-        float *v = s->value_cache + loff + t * kv_dim + kv_head_off;
-        // get the attention weight for this timestep
-        float a = att[t];
-        // accumulate the weighted value into xb
-        for (int i = 0; i < head_size; i++) {
-          xb[i] += a * v[i];
-        }
-      }
-    }
+    ATTN(s, p, pos, head_size, kv_dim, kv_mul, loff);
 
     // final matmul to get the output of the attention
     matmul(s->xb2, s->xb, wo_l, dim, dim);
@@ -1128,11 +1233,6 @@ void perplexity(Transformer *transformer, Tokenizer *tokenizer, const char *data
   int chunk_count = 0;
   double total_loss = 0.0;
   int total_scored = 0;
-  #ifdef __FAST_MATH__
-    const float inf = 1e10f;  // fake-away infinity check for ffast-math
-  #else
-    const float inf = INFINITY;
-  #endif
 
   fprintf(stderr, "Calculating perplexity over chunks (n_ctx=%d ppl_stride=%d first_scored=%d)\n",
           n_ctx, ppl_stride, first_scored);
@@ -1163,7 +1263,7 @@ void perplexity(Transformer *transformer, Tokenizer *tokenizer, const char *data
       total_scored += chunk_scored;
       chunk_count++;
       float cum_ppl = (float)exp(total_loss / total_scored);
-      fprintf(stderr, "[%d]%.4f ", chunk_count, cum_ppl < 1e2f ? cum_ppl : inf);
+      fprintf(stderr, "[%d]%.4f ", chunk_count, cum_ppl < 1e2f ? cum_ppl : INF);
     }
   }
   fprintf(stderr, "\n");
@@ -1176,7 +1276,7 @@ void perplexity(Transformer *transformer, Tokenizer *tokenizer, const char *data
   }
 
   float mean_loss = (float)(total_loss / total_scored);
-  float ppl = (mean_loss < 1e2f) ? (float)exp(mean_loss) : inf;
+  float ppl = (mean_loss < 1e2f) ? (float)exp(mean_loss) : INF;
   fprintf(stdout, "Loss:  %.4f\n", mean_loss);
   fprintf(stdout, "PPL:   %.4f\n", ppl);
 }
