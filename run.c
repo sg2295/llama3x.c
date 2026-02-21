@@ -595,14 +595,22 @@ void free_tokenizer(Tokenizer *t) {
   free(t->sorted_vocab);
 }
 
-unsigned char *decode(Tokenizer *t, int prev_token, int token, int *piece_len) {
-  (void)prev_token;
+unsigned char *decode(Tokenizer *t, int token, int *piece_len) {
   if (token < 0 || token >= t->vocab_size) {
     *piece_len = 0;
     return NULL;
   }
-  *piece_len = t->vocab_lens[token];
-  return t->vocab[token];
+  unsigned char *piece = t->vocab[token];
+  int len = t->vocab_lens[token];
+  // Ignore special tokens
+  const char *rsrvd_prefix = "<|reserved_special_token_";
+  const int rsrvd_len = 25;
+  if (len >= rsrvd_len && memcmp(piece, rsrvd_prefix, rsrvd_len) == 0) {
+    *piece_len = 0;
+    return piece;  // caller ignores when piece_len is 0
+  }
+  *piece_len = len;
+  return piece;
 }
 
 void safe_printf(unsigned char *piece, int piece_len) {
@@ -931,7 +939,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
       break;
     // print the token as string, decode it with the Tokenizer object
     int piece_len = 0;
-    unsigned char *piece = decode(tokenizer, token, next, &piece_len);
+    unsigned char *piece = decode(tokenizer, next, &piece_len);
     safe_printf(piece, piece_len); // prints raw token bytes, skipping unsafe single-byte controls
     fflush(stdout);
     token = next;
@@ -1069,7 +1077,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
     if (user_idx >= num_prompt_tokens && next != 128009 && next != 128001 && next != 128006) {
       // the Assistant is responding, so print its output
       int piece_len = 0;
-      unsigned char *piece = decode(tokenizer, token, next, &piece_len);
+      unsigned char *piece = decode(tokenizer, next, &piece_len);
       safe_printf(piece, piece_len); // prints raw token bytes, skipping unsafe single-byte controls
       fflush(stdout);
     }
