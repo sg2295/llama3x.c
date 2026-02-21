@@ -112,12 +112,42 @@ def get_tokenizer(hf_model_path: str) -> Tokenizer:
 
     raise ValueError(f"No tokenizer found in {hf_model_path}!")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input_hf_model", type=str, help="input huggingface model path")
-    parser.add_argument("output_tokenizer_bin", type=str, help="output tokenizer binary path", default="tokenizer.bin")
+def tokenize_file(tokenizer: Tokenizer, input_path: str, output_path: str,) -> None:
+    """Tokenize text file and write binary format for C perplexity (-d file.tok)."""
+    with open(input_path, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    ids = tokenizer.encode(
+        text,
+        bos=True,
+        eos=False,
+        allowed_special="all",
+        disallowed_special=(),
+    )
+    TOK_MAGIC = b"TOK"
+    with open(output_path, "wb") as f:
+        f.write(TOK_MAGIC)
+        f.write(struct.pack("<I", len(ids)))
+        f.write(struct.pack(f"<{len(ids)}I", *ids))
 
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Export tokenizer.bin or pre-tokenize text file")
+    parser.add_argument("input_hf_model", type=str, help="HuggingFace model path")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    p_export = subparsers.add_parser("export", help="Export tokenizer.bin from HuggingFace model")
+    p_export.add_argument(
+        "output_tokenizer_bin", type=str, nargs="?", default="tokenizer.bin", help="Output tokenizer.bin path"
+    )
+
+    p_tokenize = subparsers.add_parser("tokenize", help="Pre-tokenize text file")
+    p_tokenize.add_argument("input_txt", type=str, help="Input text file")
+    p_tokenize.add_argument("output_tok", type=str, help="Output .tok binary file")
     args = parser.parse_args()
 
     t = get_tokenizer(args.input_hf_model)
-    t.export(args.output_tokenizer_bin)
+
+    if args.command == "export":
+        t.export(args.output_tokenizer_bin)
+    else:  # tokenize
+        tokenize_file(t, args.input_txt, args.output_tok)

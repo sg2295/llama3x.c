@@ -520,7 +520,7 @@ int str_lookup(const unsigned char *str, int str_len, TokenIndex *sorted_vocab, 
   return res != NULL ? res->id : -1;
 }
 
-static void init_sorted_vocab(Tokenizer *t) {
+void init_sorted_vocab(Tokenizer *t) {
   if (t->sorted_vocab != NULL) return;
   t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
   for (int i = 0; i < t->vocab_size; i++) {
@@ -1009,13 +1009,87 @@ float cross_entropy_loss(float *logits, int vocab_size, int target) {
   return log_sum - logits[target];
 }
 
-void perplexity(
-    Transformer *transformer,
-    Tokenizer *tokenizer,
-    const char *data_path,
-    int n_ctx,
-    int ppl_stride,
-    int n_chunks) {
+// Load tokens from file; caller should take care to free
+// Can handle either pre-tokenized bin (TOK header) or raw text (C encode; N.B. slow for large files!)
+int *load_tokens(const char *data_path, Tokenizer *tokenizer, int *num_tokens_out) {
+  FILE *f = fopen(data_path, "rb");
+  if (!f) {
+    fprintf(stderr, "Could not open %s\n", data_path);
+    return NULL;
+  }
+  char magic[4];
+  if (fread(magic, 1, 3, f) != 3) {
+    fclose(f);
+    fprintf(stderr, "Failed to read file\n");
+    return NULL;
+  }
+  int *tokens = NULL;
+  int num_tokens = 0;
+
+  if (strcmp(magic, "TOK") == 0) {
+    unsigned int count;
+    if (fread(&count, sizeof(count), 1, f) != 1) {
+      fclose(f);
+      fprintf(stderr, "Failed to read token count\n");
+      return NULL;
+    }
+    tokens = malloc((size_t)count * sizeof(int));
+    if (!tokens) {
+      fclose(f);
+      fprintf(stderr, "malloc failed\n");
+      return NULL;
+    }
+    for (unsigned int i = 0; i < count; i++) {
+      unsigned int tok;
+      if (fread(&tok, sizeof(tok), 1, f) != 1) {
+        free(tokens);
+        fclose(f);
+        fprintf(stderr, "Failed to read token %u\n", i);
+        return NULL;
+      }
+      tokens[i] = (int)tok;
+    }
+    fclose(f);
+    num_tokens = (int)count;
+    fprintf(stderr, "Loaded %d pre-tokenized tokens\n", num_tokens);
+  } else {
+    fseek(f, 0, SEEK_SET);
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *text = malloc(fsize + 1);
+    if (!text) {
+      fclose(f);
+      fprintf(stderr, "malloc failed\n");
+      return NULL;
+    }
+    if (fread(text, 1, fsize, f) != (size_t)fsize) {
+      free(text);
+      fclose(f);
+      fprintf(stderr, "Failed to read file\n");
+      return NULL;
+    }
+    text[fsize] = '\0';
+    fclose(f);
+
+    int max_tokens = (int)(fsize * 2) + 128;
+    tokens = malloc((size_t)max_tokens * sizeof(int));
+    if (!tokens) {
+      free(text);
+      fprintf(stderr, "malloc failed\n");
+      return NULL;
+    }
+    fprintf(stderr, "Tokenising (slow for large files)");
+    encode(tokenizer, text, 1, 0, tokens, &num_tokens);
+    free(text);
+    fprintf(stderr, "Tokenised %d tokens\n", num_tokens);
+  }
+
+  *num_tokens_out = num_tokens;
+  return tokens;
+}
+
+void perplexity(Transformer *transformer, Tokenizer *tokenizer, const char *data_path, int n_ctx, int ppl_stride, int n_chunks) {
   Config *p = &transformer->config;
   RunState *s = &transformer->state;
   int vocab_size = p->vocab_size;
@@ -1029,49 +1103,16 @@ void perplexity(
     return;
   }
 
-  // Load file
-  FILE *f = fopen(data_path, "rb");
-  if (!f) {
-    fprintf(stderr, "Could not open %s\n", data_path);
-    return;
-  }
-  fseek(f, 0, SEEK_END);
-  long fsize = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  char *text = malloc(fsize + 1);
-  if (!text) {
-    fclose(f);
-    fprintf(stderr, "malloc failed\n");
-    return;
-  }
-  if (fread(text, 1, fsize, f) != (size_t)fsize) {
-    free(text);
-    fclose(f);
-    fprintf(stderr, "Failed to read file\n");
-    return;
-  }
-  text[fsize] = '\0';
-  fclose(f);
-
-  // Tokenize (add BOS)
-  int max_tokens = (int)(fsize * 2) + 128;  // rough upper bound
-  int *tokens = malloc((size_t)max_tokens * sizeof(int));
-  if (!tokens) {
-    free(text);
-    fprintf(stderr, "malloc failed\n");
-    return;
-  }
   int num_tokens = 0;
+  int *tokens = load_tokens(data_path, tokenizer, &num_tokens);
+  if (!tokens)
+    return;
 
-  printf("Tokenising...\n");
-  encode(tokenizer, text, 1, 0, tokens, &num_tokens);
-  free(text);
   if (num_tokens < 2) {
     fprintf(stderr, "Too few tokens in file\n");
     free(tokens);
     return;
   }
-  printf("Tokenised!\n");
 
   int min_tokens = (ppl_stride == 0) ? (2 * n_ctx) : (n_ctx + 1);
   if (num_tokens < min_tokens) {
@@ -1122,7 +1163,7 @@ void perplexity(
       total_scored += chunk_scored;
       chunk_count++;
       float cum_ppl = (float)exp(total_loss / total_scored);
-      fprintf(stderr, "[%d]%.4f ", chunk_count, cum_ppl < 1e2f ? cum_ppl : 1e10f);
+      fprintf(stderr, "[%d]%.4f ", chunk_count, cum_ppl < 1e2f ? cum_ppl : inf);
     }
   }
   fprintf(stderr, "\n");
@@ -1135,7 +1176,7 @@ void perplexity(
   }
 
   float mean_loss = (float)(total_loss / total_scored);
-  float ppl = (mean_loss < 1e2f) ? (float)exp(mean_loss) : 1e10f;
+  float ppl = (mean_loss < 1e2f) ? (float)exp(mean_loss) : inf;
   fprintf(stdout, "Loss:  %.4f\n", mean_loss);
   fprintf(stdout, "PPL:   %.4f\n", ppl);
 }
@@ -1147,7 +1188,8 @@ void perplexity(
 void error_usage() {
   fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
   fprintf(stderr, "Example: run model.bin -n 4096 -i \"Once upon a time\"\n");
-  fprintf(stderr, "         run model.bin -m perplexity -d eval.txt -c 512\n");
+  fprintf(stderr, "         run model.bin -m perplexity -d eval.txt -c 512  // raw text; slow for large files\n");
+  fprintf(stderr, "         run model.bin -m perplexity -d eval.tok -c 512  // pre-tokenized bin; faster\n");
   fprintf(stderr, "Options:\n");
   fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
   fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
