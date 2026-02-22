@@ -32,7 +32,7 @@ Use legacy export to produce compatible .bin files.
 #elif ATTN_TYPE == FLASH_V2
 #define ATTN flash_attention
 #else
-#error "Invalid SA_TYPE"
+#error "Invalid ATTN_TYPE"
 #endif
 
 #ifdef __FAST_MATH__
@@ -42,6 +42,20 @@ Use legacy export to produce compatible .bin files.
   #define INF INFINITY
 #endif
 
+#define FP32 1
+#define FP16 2
+
+#ifndef ATTN_DTYPE
+#define ATTN_DTYPE FP32
+#endif
+
+#if ATTN_DTYPE == FP32
+typedef float attn_t;
+#elif ATTN_DTYPE == FP16
+typedef _Float16 attn_t;
+#else
+#error "Invalid ATTN_DTYPE"
+#endif
 
 // ----------------------------------------------------------------------------
 // Transformer model
@@ -88,13 +102,11 @@ typedef struct {
   float *hb;     // buffer for hidden dimension in the ffn (hidden_dim,)
   float *hb2;    // buffer for hidden dimension in the ffn (hidden_dim,)
   float *q;      // query (dim,)
-  float *k;      // key (dim,)
-  float *v;      // value (dim,)
-  float *att;    // buffer for scores/attention values (n_heads, seq_len)
+  attn_t *att;   // buffer for scores/attention values (n_heads, seq_len)
   float *logits; // output logits
-  // kv cache
-  float *key_cache;   // (layer, seq_len, dim)
-  float *value_cache; // (layer, seq_len, dim)
+  // kv cache - attn_t for FP16 (conditional), 1/2 memory usage
+  attn_t *key_cache;   // (layer, seq_len, kv_dim)
+  attn_t *value_cache; // (layer, seq_len, kv_dim)
 } RunState;
 
 typedef struct {
@@ -116,9 +128,9 @@ void malloc_run_state(RunState *s, Config *p) {
   s->hb = calloc(p->hidden_dim, sizeof(float));
   s->hb2 = calloc(p->hidden_dim, sizeof(float));
   s->q = calloc(p->dim, sizeof(float));
-  s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-  s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-  s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
+  s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(attn_t));
+  s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(attn_t));
+  s->att = calloc(p->n_heads * p->seq_len, sizeof(attn_t));
   s->logits = calloc(p->vocab_size, sizeof(float));
   // ensure all mallocs went fine
   if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
@@ -210,9 +222,12 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
   memory_map_weights(weights, config, weights_ptr, shared_weights);
 
   char *attn_type_str = ATTN_TYPE == STANDARD ? "standard" : "flash";
-  fprintf(stderr, "Model config: dim=%d hidden=%d layers=%d heads=%d kv_heads=%d vocab=%d seq_len=%d (attn_type=%s)\n",
-          config->dim, config->hidden_dim, config->n_layers, config->n_heads,
-          config->n_kv_heads, config->vocab_size, config->seq_len, attn_type_str);
+  char *attn_dtype_str = ATTN_DTYPE == FP32 ? "FP32" : "FP16";
+  fprintf(stderr,
+    "Model config: dim=%d hidden=%d layers=%d heads=%d kv_heads=%d vocab=%d seq_len=%d (attn_type=%s, attn_dtype=%s)\n",
+    config->dim, config->hidden_dim, config->n_layers, config->n_heads, config->n_kv_heads, config->vocab_size,
+    config->seq_len, attn_type_str, attn_dtype_str
+  );
 }
 
 void build_transformer(Transformer *t, char *checkpoint_path) {
@@ -278,64 +293,89 @@ void softmax(float *x, int size) {
   }
 }
 
+// convert float to/from attn_t for/after attention
+void to_attn(attn_t *dst, const float *src, int n) {
+  for (int i = 0; i < n; i++) dst[i] = (attn_t)src[i];
+}
+
+void from_attn(float *dst, const attn_t *src, int n) {
+  for (int i = 0; i < n; i++) dst[i] = (float)src[i];
+}
+
+attn_t reduce_max_attn(attn_t *x, int size) {
+  attn_t max_val = x[0];
+  for (int i = 1; i < size; i++) {
+    if (x[i] > max_val) max_val = x[i];
+  }
+  return max_val;
+}
+
+void softmax_attn(attn_t *x, int size) {
+  attn_t max_val = reduce_max_attn(x, size);
+  attn_t sum = 0.0f;  // Could experiment with float (if we see lots of infs)
+  for (int i = 0; i < size; i++) {
+    // No fp16 expf, so need to cast up and back down immediately...
+    attn_t v = (attn_t)expf((float)(x[i] - max_val));
+    x[i] = v;
+    sum += v;
+  }
+  attn_t inv_sum = (attn_t)(1.0f / sum);
+  for (int i = 0; i < size; i++) {
+    x[i] *= inv_sum;
+  }
+}
+
 void standard_attention(RunState *s, Config *p, int pos, int head_size, int kv_dim, int kv_mul, int loff) {
-  const float inv_sqrt_head_size = 1.0f / sqrtf((float)head_size);
+  const attn_t inv_sqrt_head_size = 1.0f / sqrtf((attn_t)head_size);
   int h;
 #pragma omp parallel for private(h)
   for (h = 0; h < p->n_heads; h++) {
-    // get the query vector for this head
     float *q = s->q + h * head_size;
-    // attention scores for this head
-    float *att = s->att + h * p->seq_len;
+    attn_t *att = s->att + h * p->seq_len;
     int kv_head_off = (h / kv_mul) * head_size;
-    // iterate over all timesteps, including the current one
     for (int t = 0; t <= pos; t++) {
-      // get the key vector for this head and at this timestep
-      float *k = s->key_cache + loff + t * kv_dim + kv_head_off;
-      // calculate the attention score as the dot product of q and k
-      float score = 0.0f;
+      attn_t *k = s->key_cache + loff + t * kv_dim + kv_head_off;
+      attn_t score = 0;
       for (int i = 0; i < head_size; i++) {
-        score += q[i] * k[i];
+        score += (attn_t)q[i] * k[i];
       }
       score *= inv_sqrt_head_size;
-      // save the score to the attention buffer
       att[t] = score;
     }
 
-    // softmax the scores to get attention weights, from 0..pos inclusively
-    softmax(att, pos + 1);
+    softmax_attn(att, pos + 1);
 
-    // weighted sum of the values, store back into xb
-    float *xb = s->xb + h * head_size;
-    memset(xb, 0, head_size * sizeof(float));
+    attn_t xb_acc[head_size];
+    memset(xb_acc, 0, head_size * sizeof(attn_t));
     for (int t = 0; t <= pos; t++) {
-      // get the value vector for this head and at this timestep
-      float *v = s->value_cache + loff + t * kv_dim + kv_head_off;
-      // get the attention weight for this timestep
-      float a = att[t];
-      // accumulate the weighted value into xb
+      attn_t *v = s->value_cache + loff + t * kv_dim + kv_head_off;
+      attn_t a = att[t];
       for (int i = 0; i < head_size; i++) {
-        xb[i] += a * v[i];
+        xb_acc[i] += a * v[i];
       }
     }
+    // Convert back to float
+    float *xb = s->xb + h * head_size;
+    from_attn(xb, xb_acc, head_size);
   }
 }
 
 // FlashAttention v2 (https://arxiv.org/abs/2307.08691); online softmax + KV-blocks
+// (Currently only support decode; if we want to do prefill should also add Q-blocks)
 #define K_BLK 128
 
 void flash_attention(RunState *s, Config *p, int pos, int head_size, int kv_dim, int kv_mul, int loff) {
-  const float inv_sqrt_head_size = 1.0f / sqrtf((float)head_size);
+  const attn_t inv_sqrt_head_size = (attn_t)(1.0f / sqrtf((float)head_size));
   int h;
 #pragma omp parallel for private(h)
   for (h = 0; h < p->n_heads; h++) {
     float *q = s->q + h * head_size;
-    float *xb = s->xb + h * head_size;
+    attn_t xb_acc[head_size];
     int kv_head_off = (h / kv_mul) * head_size;
 
-    float cmax = -INF;
-    float csum = 0.0f;  // Running sum of exps
-    memset(xb, 0, head_size * sizeof(float));
+    attn_t cmax = -INF;
+    attn_t csum = 0.0f;
+    memset(xb_acc, 0, head_size * sizeof(attn_t));
 
     int n = pos + 1;
     for (int k_start = 0; k_start < n; k_start += K_BLK) {
@@ -343,49 +383,50 @@ void flash_attention(RunState *s, Config *p, int pos, int head_size, int kv_dim,
       int k_size = k_end - k_start;
 
       // S = Q @ K^T
-      float scores[K_BLK];
+      attn_t scores[K_BLK];
       for (int j = 0; j < k_size; j++) {
-        float *k = s->key_cache + loff + (k_start + j) * kv_dim + kv_head_off;
-        float score = 0.0f;
+        attn_t *k = s->key_cache + loff + (k_start + j) * kv_dim + kv_head_off;
+        attn_t score = 0;
         for (int i = 0; i < head_size; i++) {
-          score += q[i] * k[i];
+          score += (attn_t)q[i] * k[i];
         }
         scores[j] = score * inv_sqrt_head_size;
       }
 
       // Update running max
-      float bmax = reduce_max(scores, k_size);
-      float nmax = (bmax > cmax) ? bmax : cmax;      
-      float correction = expf(cmax - nmax);
+      attn_t bmax = reduce_max_attn(scores, k_size);
+      attn_t nmax = (bmax > cmax) ? bmax : cmax;
+      attn_t correction = (attn_t)expf((float)(cmax - nmax));
 
       // Calculate probs for current block
-      float bsum = 0.0f;
-      float probs[K_BLK];
+      attn_t bsum = 0.0f;
+      attn_t probs[K_BLK];
       for (int j = 0; j < k_size; j++) {
-        probs[j] = expf(scores[j] - nmax);
+        probs[j] = (attn_t)expf((float)(scores[j] - nmax));
         bsum += probs[j];
       }
-      float nsum = csum * correction + bsum;
+      attn_t nsum = csum * correction + bsum;
 
       // Adjust previous outs
-      float scale_prior = (nsum > 0.0f) ? (csum * correction / nsum) : 0.0f;
+      attn_t scale_prior = (attn_t)((nsum > 0.0f) ? (csum * correction / nsum) : 0.0f);
       for (int i = 0; i < head_size; i++) {
-        xb[i] *= scale_prior;
+        xb_acc[i] *= scale_prior;
       }
 
       // Add block contrib
       for (int j = 0; j < k_size; j++) {
-        float w = (nsum > 0.0f) ? (probs[j] / nsum) : 0.0f;
-        float *v = s->value_cache + loff + (k_start + j) * kv_dim + kv_head_off;
+        attn_t w = (attn_t)((nsum > 0.0f) ? (probs[j] / nsum) : 0.0f);
+        attn_t *v = s->value_cache + loff + (k_start + j) * kv_dim + kv_head_off;
         for (int i = 0; i < head_size; i++) {
-          xb[i] += w * v[i];
+          xb_acc[i] += w * v[i];
         }
       }
 
-      // Update running max/sum of exps
       cmax = nmax;
       csum = nsum;
     }
+
+    from_attn(s->xb + h * head_size, xb_acc, head_size);
   }
 }
 
@@ -430,12 +471,10 @@ float *forward(Transformer *transformer, int token, int pos) {
     // attention rmsnorm
     rmsnorm(s->xb, x, w->rms_att_weight + layer_off, dim);
 
-    // key and value point to the kv cache
-    int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
-    s->k = s->key_cache + loff + pos * kv_dim;
-    s->v = s->value_cache + loff + pos * kv_dim;
+    // key and value buffs
+    float k_buf[kv_dim];
+    float v_buf[kv_dim];
 
-    // qkv matmuls for this position
     float *wq_l = w->wq + layer_qo_off;
     float *wk_l = w->wk + layer_kv_off;
     float *wv_l = w->wv + layer_kv_off;
@@ -444,8 +483,8 @@ float *forward(Transformer *transformer, int token, int pos) {
     float *w2_l = w->w2 + layer_off * hidden_dim;
     float *w3_l = w->w3 + layer_off * hidden_dim;
     matmul(s->q, s->xb, wq_l, dim, dim);
-    matmul(s->k, s->xb, wk_l, dim, kv_dim);
-    matmul(s->v, s->xb, wv_l, dim, kv_dim);
+    matmul(k_buf, s->xb, wk_l, dim, kv_dim);
+    matmul(v_buf, s->xb, wv_l, dim, kv_dim);
 
     // RoPE: precomputed cosine and sine values for each position/head.
     for (int i = 0; i < p->n_heads; i++) {
@@ -459,13 +498,20 @@ float *forward(Transformer *transformer, int token, int pos) {
         s->q[i * head_size + j] = q0 * fcr - q1 * fci;
         s->q[i * head_size + j + 1] = q0 * fci + q1 * fcr;
         if (i < p->n_kv_heads) {
-          float k0 = s->k[i * head_size + j];
-          float k1 = s->k[i * head_size + j + 1];
-          s->k[i * head_size + j] = k0 * fcr - k1 * fci;
-          s->k[i * head_size + j + 1] = k0 * fci + k1 * fcr;
+          float k0 = k_buf[i * head_size + j];
+          float k1 = k_buf[i * head_size + j + 1];
+          k_buf[i * head_size + j] = k0 * fcr - k1 * fci;
+          k_buf[i * head_size + j + 1] = k0 * fci + k1 * fcr;
         }
       }
     }
+    // Copy-convert KVs into cache
+    int loff = l * p->seq_len * kv_dim;
+    attn_t *k_cache_pos = s->key_cache + loff + pos * kv_dim;
+    attn_t *v_cache_pos = s->value_cache + loff + pos * kv_dim;
+
+    to_attn(k_cache_pos, k_buf, kv_dim);
+    to_attn(v_cache_pos, v_buf, kv_dim);
 
     // multihead attention. iterate over all heads
     ATTN(s, p, pos, head_size, kv_dim, kv_mul, loff);
@@ -954,6 +1000,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
   // report achieved tok/s (pos-1 because the timer starts after first iteration)
   if (pos > 1) {
     long end = time_in_ms();
+    fprintf(stderr, "Processed tokens: %d\n", pos);
     fprintf(stderr, "achieved tok/s: %f\n", (pos - 1) / (double)(end - start) * 1000);
   }
 
@@ -1101,7 +1148,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
 
 void clear_kv_cache(RunState *s, Config *p) {
   int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-  size_t cache_size = (size_t)p->n_layers * p->seq_len * kv_dim * sizeof(float);
+  size_t cache_size = (size_t)p->n_layers * p->seq_len * kv_dim * sizeof(attn_t);
   memset(s->key_cache, 0, cache_size);
   memset(s->value_cache, 0, cache_size);
 }
@@ -1423,6 +1470,11 @@ int main(int argc, char *argv[]) {
   // memory and file handles cleanup
   free_tokenizer(&tokenizer);
   free_transformer(&transformer);
+
+  // Report peak mem usage
+  struct rusage usage;
+  getrusage(RUSAGE_SELF, &usage);
+  fprintf(stderr, "peak RSS: %zu MB\n", usage.ru_maxrss / 1024 / 1024);
   return 0;
 }
 #endif

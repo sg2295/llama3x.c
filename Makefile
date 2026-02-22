@@ -1,5 +1,5 @@
 CC = clang
-CFLAGS = -O3 -ffast-math -Xclang -fopenmp -std=c23
+CFLAGS = -O3 -ffast-math -Xclang -fopenmp -std=c23 -march=native
 LDFLAGS = -L/opt/homebrew/opt/libomp/lib -lomp
 CPPFLAGS = -I/opt/homebrew/opt/libomp/include
 MKFLAGS ?=
