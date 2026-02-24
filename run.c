@@ -960,10 +960,11 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
   }
 
   // start the main loop
-  long start = 0;               // used to time our code, only initialized after first iteration
+  long start = time_in_ms();    // used to time our code
   int next;                     // will store the next token in the sequence
   int token = prompt_tokens[0]; // kick off with the first token in the prompt
   int pos = 0;                  // position in the sequence
+  long ttft = 0;
 
   while (pos < steps) {
 
@@ -990,18 +991,19 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     fflush(stdout);
     token = next;
 
-    // init the timer here because the first iteration can be slower
-    if (start == 0) {
-      start = time_in_ms();
+    // record ttft
+    if (pos == num_prompt_tokens) {
+      ttft = time_in_ms();
     }
   }
   printf("\n");
 
-  // report achieved tok/s (pos-1 because the timer starts after first iteration)
-  if (pos > 1) {
+  // report achieved tok/s (after processing prompt)
+  if (pos > num_prompt_tokens) {
     long end = time_in_ms();
     fprintf(stderr, "Processed tokens: %d\n", pos);
-    fprintf(stderr, "achieved tok/s: %f\n", (pos - 1) / (double)(end - start) * 1000);
+    fprintf(stderr, "Time to first token: %ld ms\n", ttft - start);
+    fprintf(stderr, "achieved tok/s: %f\n", pos / (double)(end - start) * 1000);
   }
 
   free(prompt_tokens);
@@ -1347,7 +1349,7 @@ void error_usage() {
   fprintf(stderr, "         run model.bin -m perplexity -d eval.tok -c 512  // pre-tokenized bin; faster\n");
   fprintf(stderr, "Options:\n");
   fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
-  fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
+  fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 1 (1=disable)\n");
   fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
   fprintf(stderr, "  -n <int>    number of steps to run for, default 4096. 0 = max_seq_len\n");
   fprintf(stderr, "  -i <string> input prompt\n");

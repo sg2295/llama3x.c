@@ -1,9 +1,19 @@
 import argparse
+import time
+
 import torch
 
 from export import load_hf_model
 from tokenizer import get_tokenizer
 
+def sample_next_token(logits: torch.Tensor, temp: float) -> torch.Tensor:
+    if temp == 0.0:
+        _, idx_next = torch.topk(logits, k=1, dim=-1)
+    else:
+        logits = logits / temp
+        probs = torch.softmax(logits, dim=-1)
+        idx_next = torch.multinomial(probs, num_samples=1)
+    return idx_next
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -42,20 +52,45 @@ if __name__ == "__main__":
         allowed_special="all",
         disallowed_special=(),
     )
-    x = torch.tensor([input_ids], dtype=torch.long, device=device)
+    idx = torch.tensor([input_ids], dtype=torch.long, device=device)
+
+    # Print prompt immediately, flush so it appears before generation
+    print(prompt, end="", flush=True)
+
+    ttft = None
+    num_generated = 0
+
+    start_time = time.perf_counter()
+
     with torch.inference_mode():
-        y = model.generate(
-            x,
-            max_new_tokens=args.max_tokens,
-            temperature=args.temperature,
-        )
-    out_ids = y[0].tolist()
-    # Drop the prompt tokens and stop at first stop token
-    gen_ids = []
-    for tok in out_ids[len(input_ids) :]:
-        if tok in tokenizer.stop_tokens:
-            break
-        gen_ids.append(tok)
-    text = tokenizer.decode(gen_ids)
-    output = prompt + text
-    print(output)
+        # We don't use generate so that we can get TTFT and flush output
+        for _ in range(args.max_tokens):
+            idx_cond = (
+                idx
+                if idx.size(1) <= model.params.max_seq_len
+                else idx[:, -model.params.max_seq_len :]
+            )
+            logits = model(idx_cond)[:, -1, :]  # fwd pass
+
+            idx_next = sample_next_token(logits, args.temperature)
+
+            next_id = idx_next.item()
+
+            if next_id in tokenizer.stop_tokens:
+                break
+
+            piece = tokenizer.decode([next_id])
+            print(piece, end="", flush=True)
+            num_generated += 1
+
+            if ttft is None:
+                ttft = time.perf_counter() - start_time
+
+            idx = torch.cat((idx, idx_next), dim=1)
+
+    if ttft is not None:
+        elapsed = time.perf_counter() - start_time
+        tok_s = num_generated / elapsed if elapsed > 0 else 0
+        print(f"Processed tokens: {num_generated}")
+        print(f"Time to first token: {ttft * 1000:.0f} ms")
+        print(f"Achieved tok/s: {tok_s:.1f}")
